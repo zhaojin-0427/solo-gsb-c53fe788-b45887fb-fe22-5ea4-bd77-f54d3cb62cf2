@@ -17,8 +17,13 @@
   `<timestamp>.<紧凑排序 JSON 载荷>`。
 - **指数退避 + 死信**：失败按 `base * 2^(n-1)` 退避（封顶），**最多 6 次尝试**
   后进入死信队列。
+- **订阅配置版本与无损切换**：`target_url`、HMAC 密钥与重试参数保存为
+  **不可变版本**；发布新版本以 `expected_revision` 做 CAS（并发发布只有一个
+  成功），并与事件提交原子确定切换边界——边界前的投递（含后续重试）始终用
+  旧版本，边界后的投递用新版本；死信重放默认沿用原版本，也可显式选用当前
+  版本。
 - **投递历史 / 死信重放**：可查询投递与每次尝试明细；重放会在同一投递链
-  （`chain_id`）上**新建投递记录**（`chain_seq + 1`），旧记录完整保留。
+  （`chain_id`）的链尾**新建投递记录**（`chain_seq` 递增），旧记录完整保留。
 - **本地回调接收器**：内置带签名校验、成功/失败/前 N 次失败/慢响应等端点的
   Receiver，便于本地联调与演示。
 
@@ -118,6 +123,51 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 也可把目标设为 `http://receiver:8001/fail/2`：对同一投递前 2 次返回 500、
 第 3 次返回 200，可快速观察退避后重试成功。
 
+### 配置版本与无损切换
+
+每个订阅的配置（`target_url`、HMAC 密钥、重试参数）以**不可变版本**保存；
+注册订阅即创建 `revision 1`。发布新版本必须携带 `expected_revision`（CAS）：
+
+```bash
+# 读取当前版本号
+curl -s localhost:8000/api/v1/subscriptions/1 | python3 -m json.tool
+#   -> "current_revision": 1
+
+# 发布 revision 2：换回调地址 + 自定义重试参数（未提供的字段沿用当前版本；
+# 重试参数显式传 null 表示恢复为跟随全局默认）
+curl -s -X POST localhost:8000/api/v1/subscriptions/1/config-versions \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1,
+       "target_url":"http://receiver:8001/receive",
+       "secret":"rotated-secret-2",
+       "max_attempts":4,
+       "backoff_base_seconds":2}'
+
+# 版本列表：含切换边界（first/last_delivery_seq），永不返回密钥
+curl -s localhost:8000/api/v1/subscriptions/1/versions | python3 -m json.tool
+```
+
+语义保证：
+
+- **原子边界**：发布与事件提交在同一订阅行锁上串行化。与发布竞争的事件
+  必然落在边界某一侧：提交时读到的版本即其全部投递永久固定的版本，
+  不会在重试中途改用另一版本。
+- **CAS 互斥**：`expected_revision` 不等于当前 `current_revision` 时返回
+  **409**（响应含当前版本号）；并发发布只有一个成功。
+- **在途无损**：边界前已创建的投递及后续重试始终使用旧版本的 URL、密钥与
+  重试参数；边界后的投递使用新版本。
+- **重放版本选择**：死信重放默认沿用原投递的版本；显式传
+  `{"use_current_config": true}` 改用当前版本，选择结果随新投递记录固化：
+
+```bash
+curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay \
+  -H 'Content-Type: application/json' \
+  -d '{"use_current_config": true}'
+```
+
+- **可观测不泄密**：投递查询返回 `seq` 与 `config_revision`，版本查询返回
+  每个版本生效的投递区间（`first/last_delivery_seq`）；所有响应均不含密钥。
+
 ## API 一览
 
 所有业务 API 前缀为 `/api/v1`，交互文档见 `/docs`。
@@ -127,14 +177,16 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 | POST | `/events` | 提交/幂等提交事件；首次 201，重复 200 |
 | GET | `/events/{id}` | 查询事件 |
 | GET | `/events/{id}/deliveries` | 事件对应的所有投递 |
-| POST | `/subscriptions` | 注册订阅（同 source+URL 重复注册为重新激活） |
-| GET | `/subscriptions?source=` | 列出订阅 |
-| GET | `/subscriptions/{id}` | 查询订阅 |
-| GET | `/deliveries?status=&subscription_id=&source=` | 投递历史 |
+| POST | `/subscriptions` | 注册订阅（同 source+URL 重复注册为重新激活；密钥变化自动发布新版本） |
+| GET | `/subscriptions?source=` | 列出订阅（含 `current_revision`） |
+| GET | `/subscriptions/{id}` | 查询订阅（含 `current_revision`） |
+| POST | `/subscriptions/{id}/config-versions` | CAS 发布新配置版本（201；版本冲突 409；URL 撞占用 409） |
+| GET | `/subscriptions/{id}/versions` | 配置版本列表及切换边界（不含密钥） |
+| GET | `/deliveries?status=&subscription_id=&source=` | 投递历史（含 `seq`、`config_revision`） |
 | GET | `/deliveries/{id}` | 投递详情 |
 | GET | `/deliveries/{id}/attempts` | 每次尝试明细（状态码、响应摘要、错误、租约时间） |
 | GET | `/dead-letters?subscription_id=&source=` | 死信列表 |
-| POST | `/dead-letters/{id}/replay` | 死信重放（201；非死信 409；链上有未完成投递 409） |
+| POST | `/dead-letters/{id}/replay` | 死信重放（201；非死信 409；链上有未完成投递 409）。可选请求体 `{"use_current_config": true}` 改用当前版本，默认沿用原版本 |
 | GET | `/health` | 健康检查 |
 
 投递状态：`pending`（等待/退避中）、`in_flight`（已被 Worker 认领）、
@@ -208,12 +260,22 @@ hmac.compare_digest(expected, signature_v1)
 （间隔 5/10/20/40/80 秒）。联调想快速看到死信，可调小
 `BACKOFF_BASE_SECONDS` / `BACKOFF_CAP_SECONDS`。
 
+`MAX_ATTEMPTS`、`BACKOFF_BASE_SECONDS`、`BACKOFF_CAP_SECONDS` 是**全局默认**：
+配置版本里对应字段为 NULL 的投递跟随这里的取值；也可在发布版本时按订阅
+覆盖（见“配置版本与无损切换”）。
+
 ## 数据库表
 
 - `events`：事件，`(source, event_id)` 唯一。
-- `subscriptions`：订阅（source、目标 URL、HMAC 密钥、是否启用）。
+- `subscriptions`：订阅（source、当前目标 URL、当前密钥、是否启用），并持有
+  当前版本指针 `current_revision` / `current_config_id`。
+- `subscription_configs`：**不可变配置版本**。每行固化 `target_url`、`secret`
+  与重试参数（`max_attempts`、`backoff_base_seconds`、`backoff_cap_seconds`；
+  NULL 表示跟随全局默认），`(subscription_id, revision)` 唯一。密钥仅存于
+  此表，任何 API 响应都不返回。
 - `deliveries`：投递记录。初始投递为 `(chain_id, chain_seq=1)`；重放沿用同一
-  `chain_id` 且 `chain_seq` 递增，从而保留完整历史。`seq` 是订阅顺序号。
+  `chain_id` 并在链尾追加（`chain_seq` 递增），从而保留完整历史。`seq` 是
+  订阅顺序号；`config_id` 是创建时快照的配置版本，之后（含重试）不再改变。
 - `delivery_attempts`：每次尝试的 Worker、结果分类（success/http_error/
   network_error/timeout）、HTTP 状态码、响应摘要（截断 2048 字符）、错误信息、
   租约起止时间。
@@ -232,4 +294,5 @@ uvicorn app.receiver:app --port 8001               # 接收器
 ```
 
 仓库还包含 `test_e2e.py`：用便携 PostgreSQL 拉起完整四进程拓扑，覆盖幂等、
-顺序、退避死信、重放、租约接管等场景（开发验证用，非 Docker 依赖）。
+顺序、退避死信、重放、租约接管、配置版本 CAS 与切换边界等场景
+（开发验证用，非 Docker 依赖）。

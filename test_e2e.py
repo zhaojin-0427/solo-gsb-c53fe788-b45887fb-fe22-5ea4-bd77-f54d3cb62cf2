@@ -6,6 +6,7 @@
 4. 6 次尝试后死信（指数退避）
 5. 死信重放生成新链记录、旧记录保留
 6. 租约超时接管
+7. 配置版本：CAS 发布、切换边界、在途投递沿用旧版本、重放版本选择
 """
 from __future__ import annotations
 
@@ -271,6 +272,12 @@ def main() -> int:
 
         import asyncpg
 
+        lease_sub = api.post("/api/v1/subscriptions", json={
+            "source": "lease",
+            "target_url": f"{h.rcv}/receive",
+            "secret": "dev-signing-secret",
+        }).json()
+
         async def seed_stale_lease():
             conn = await asyncpg.connect(h.dsn)
             await conn.set_type_codec(
@@ -284,29 +291,25 @@ def main() -> int:
                 """
             )
             sub = await conn.fetchrow(
-                """
-                INSERT INTO subscriptions (source, target_url, secret)
-                VALUES ('lease', $1, 'dev-signing-secret')
-                ON CONFLICT (source, target_url) DO UPDATE SET active = TRUE
-                RETURNING id
-                """,
-                f"{h.rcv}/receive",
+                "SELECT id, current_config_id FROM subscriptions WHERE id = $1",
+                lease_sub["id"],
             )
             row = await conn.fetchrow(
                 """
                 INSERT INTO deliveries
                     (event_id_fk, subscription_id, chain_id, chain_seq,
                      status, attempts_made, not_before,
-                     leased_at, lease_expires_at, leased_by)
+                     leased_at, lease_expires_at, leased_by, config_id)
                 VALUES ($1, $2, nextval('delivery_chain_seq'), 1,
                         'in_flight', 0, now() - interval '1 hour',
                         now() - interval '1 minute',
                         now() - interval '57 seconds',
-                        'dead-worker')
+                        'dead-worker', $3)
                 RETURNING id
                 """,
                 ev["id"],
                 sub["id"],
+                sub["current_config_id"],
             )
             await conn.close()
             return ev["id"], row["id"]
@@ -323,6 +326,154 @@ def main() -> int:
               and lease_attempts
               and lease_attempts[0]["worker_id"] != "dead-worker",
               f"worker={lease_attempts[0]['worker_id'] if lease_attempts else None}")
+
+        # 7) 配置版本与无损切换
+        # 恢复 /fail 的 500 行为（第 5 节关闭了它）
+        rcv.post("/control/fail", params={"enabled": True})
+
+        cfg_sub = api.post("/api/v1/subscriptions", json={
+            "source": "cfg",
+            "target_url": f"{h.rcv}/fail",
+            "secret": "dev-signing-secret",
+        }).json()
+        check("注册即创建 revision 1", cfg_sub["current_revision"] == 1,
+              json.dumps(cfg_sub))
+        check("订阅响应不泄露密钥", "secret" not in cfg_sub)
+
+        # 发布 v2：只改重试参数（max_attempts=2、退避基数 1s），URL/密钥沿用 v1
+        pub2 = api.post(
+            f"/api/v1/subscriptions/{cfg_sub['id']}/config-versions",
+            json={"expected_revision": 1, "max_attempts": 2,
+                  "backoff_base_seconds": 1},
+        )
+        check("CAS 发布 v2 成功", pub2.status_code == 201
+              and pub2.json()["revision"] == 2
+              and pub2.json()["is_current"] is True
+              and pub2.json()["target_url"] == f"{h.rcv}/fail",
+              pub2.text)
+        check("版本响应不泄露密钥", "secret" not in pub2.json())
+
+        # 边界前的投递：固定 v2（每次交付只试 2 次，而非全局 6 次）
+        c1 = api.post("/api/v1/events", json={
+            "source": "cfg", "event_id": "cfg-1", "payload": {},
+        }).json()
+        c1_dl = wait_for(
+            lambda: next((x for x in api.get(
+                f"/api/v1/events/{c1['id']}/deliveries").json()), None),
+            "cfg-1 投递出现",
+        )
+        check("cfg-1 固定到 v2", c1_dl["config_revision"] == 2, json.dumps(c1_dl))
+
+        # 边界后发布 v3（换 URL 到 /receive）与 v4（并发 CAS，只有一个成功）
+        pub3 = api.post(
+            f"/api/v1/subscriptions/{cfg_sub['id']}/config-versions",
+            json={"expected_revision": 2, "target_url": f"{h.rcv}/receive"},
+        )
+        check("CAS 发布 v3 成功", pub3.status_code == 201
+              and pub3.json()["revision"] == 3, pub3.text)
+
+        stale = api.post(
+            f"/api/v1/subscriptions/{cfg_sub['id']}/config-versions",
+            json={"expected_revision": 2},
+        )
+        check("过期 expected_revision 返回 409", stale.status_code == 409, stale.text)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [
+                ex.submit(
+                    api.post,
+                    f"/api/v1/subscriptions/{cfg_sub['id']}/config-versions",
+                    json={"expected_revision": 3},
+                )
+                for _ in range(2)
+            ]
+            codes = sorted(f.result().status_code for f in futures)
+        check("并发发布只有一个成功", codes == [201, 409], f"codes={codes}")
+
+        cfg_sub_now = api.get(f"/api/v1/subscriptions/{cfg_sub['id']}").json()
+        check("当前版本推进到 4", cfg_sub_now["current_revision"] == 4)
+
+        # c1 的重试发生在 v3/v4 发布之后，但仍按 v2 的参数 2 次进死信
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{c1_dl['id']}").json()["status"]
+            == "dead_lettered",
+            "cfg-1 按 v2 参数进入死信", timeout=30,
+        )
+        c1_dl_final = api.get(f"/api/v1/deliveries/{c1_dl['id']}").json()
+        check("在途投递重试不改用新版本",
+              c1_dl_final["attempts_made"] == 2
+              and c1_dl_final["config_revision"] == 2,
+              json.dumps(c1_dl_final))
+
+        # 边界后的投递使用新版本
+        c2 = api.post("/api/v1/events", json={
+            "source": "cfg", "event_id": "cfg-2", "payload": {},
+        }).json()
+        c2_dl = wait_for(
+            lambda: next((x for x in api.get(
+                f"/api/v1/events/{c2['id']}/deliveries").json()), None),
+            "cfg-2 投递出现",
+        )
+        check("cfg-2 固定到 v4", c2_dl["config_revision"] == 4, json.dumps(c2_dl))
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{c2_dl['id']}").json()["status"]
+            == "succeeded",
+            "cfg-2 投递成功", timeout=20,
+        )
+
+        # 版本列表：边界以投递 seq 标注；任何响应都不得包含密钥
+        versions = api.get(f"/api/v1/subscriptions/{cfg_sub['id']}/versions").json()
+        by_rev = {v["revision"]: v for v in versions}
+        check("版本列表共 4 个版本", len(versions) == 4, json.dumps(versions))
+        check("版本列表不泄露密钥", all("secret" not in v for v in versions))
+        check("v2 边界 = cfg-1 的 seq",
+              by_rev[2]["first_delivery_seq"] == c1_dl_final["seq"]
+              and by_rev[2]["last_delivery_seq"] == c1_dl_final["seq"])
+        check("v3 无投递（边界为空）",
+              by_rev[3]["first_delivery_seq"] is None
+              and by_rev[3]["last_delivery_seq"] is None)
+        check("v4 为当前版本且边界起于 cfg-2",
+              by_rev[4]["is_current"] is True
+              and by_rev[4]["first_delivery_seq"] == c2_dl["seq"])
+        check("v1 非当前版本", by_rev[1]["is_current"] is False)
+
+        # 死信重放：默认沿用原版本（v2 -> /fail，仍 2 次进死信）
+        replay_old = api.post(f"/api/v1/dead-letters/{c1_dl['id']}/replay")
+        check("重放默认沿用原版本", replay_old.status_code == 201
+              and replay_old.json()["config_revision"] == 2, replay_old.text)
+        replay_old_id = replay_old.json()["new_delivery_id"]
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{replay_old_id}").json()["status"]
+            == "dead_lettered",
+            "沿用 v2 的重放再次死信", timeout=30,
+        )
+        replay_old_dl = api.get(f"/api/v1/deliveries/{replay_old_id}").json()
+        check("沿用原版本的重放仍按 v2 参数死信",
+              replay_old_dl["attempts_made"] == 2
+              and replay_old_dl["config_revision"] == 2)
+
+        # 显式选用当前版本重放（v4 -> /receive，成功），选择随新投递固化
+        replay_cur = api.post(
+            f"/api/v1/dead-letters/{c1_dl['id']}/replay",
+            json={"use_current_config": True},
+        )
+        check("重放可选用当前版本", replay_cur.status_code == 201
+              and replay_cur.json()["config_revision"] == 4, replay_cur.text)
+        replay_cur_id = replay_cur.json()["new_delivery_id"]
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{replay_cur_id}").json()["status"]
+            == "succeeded",
+            "选用当前版本的重放成功", timeout=20,
+        )
+
+        chain = api.get(f"/api/v1/events/{c1['id']}/deliveries").json()
+        check("同一事件链上三次投递版本分别为 2/2/4",
+              [d["chain_seq"] for d in chain] == [1, 2, 3]
+              and [d["config_revision"] for d in chain] == [2, 2, 4],
+              json.dumps(chain))
+        check("投递响应不泄露密钥", all("secret" not in d for d in chain))
 
     except Exception as exc:  # noqa: BLE001
         import traceback

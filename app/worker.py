@@ -30,11 +30,13 @@ WORKER_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 RESPONSE_EXCERPT_LIMIT = 2048
 
 
-def compute_backoff(attempt_number: int) -> datetime:
+def compute_backoff(
+    attempt_number: int, base_seconds: float, cap_seconds: float
+) -> datetime:
     """第 attempt_number 次失败后，下次可投递时间（指数退避，封顶）。"""
     delay = min(
-        settings.backoff_cap_seconds,
-        settings.backoff_base_seconds * (2 ** (attempt_number - 1)),
+        cap_seconds,
+        base_seconds * (2 ** (attempt_number - 1)),
     )
     return datetime.now(timezone.utc) + timedelta(seconds=delay)
 
@@ -106,6 +108,11 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
         return True
     context = dict(context_row)
     context["attempt_number"] = delivery["attempts_made"] + 1
+    # 重试参数来自投递创建时固定的配置版本（NULL 时跟随全局默认），
+    # 版本切换不会影响在途投递的重试行为。
+    max_attempts = context["max_attempts"] or settings.max_attempts
+    backoff_base = context["backoff_base_seconds"] or settings.backoff_base_seconds
+    backoff_cap = context["backoff_cap_seconds"] or settings.backoff_cap_seconds
 
     outcome, http_status, excerpt, error_message, succeeded = await deliver_once(
         client, context
@@ -134,13 +141,18 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
             )
             return True
 
-        not_before = None if succeeded else compute_backoff(attempt_number)
+        not_before = (
+            None
+            if succeeded
+            else compute_backoff(attempt_number, backoff_base, backoff_cap)
+        )
         new_status = await repo.settle_delivery(
             conn,
             delivery_id=delivery_id,
             lease_token=lease_token,
             succeeded=succeeded,
             not_before=not_before,
+            max_attempts=max_attempts,
         )
 
     if new_status == "succeeded":
@@ -149,7 +161,7 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
         log.error(
             "投递 id=%s 已达 %s 次尝试，进入死信",
             delivery_id,
-            settings.max_attempts,
+            max_attempts,
         )
     else:
         log.info(

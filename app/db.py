@@ -109,6 +109,57 @@ SCHEMA_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS idx_attempts_delivery
         ON delivery_attempts (delivery_id, attempt_number)
     """,
+    # ---- 订阅配置版本（不可变） -------------------------------------------------
+    # 每个版本固化 target_url、HMAC 密钥与重试参数；发布后内容不再改变。
+    # 重试参数为 NULL 表示跟随服务全局默认（MAX_ATTEMPTS 等环境变量）。
+    """
+    CREATE TABLE IF NOT EXISTS subscription_configs (
+        id                   BIGSERIAL PRIMARY KEY,
+        subscription_id      BIGINT NOT NULL REFERENCES subscriptions(id),
+        revision             INTEGER NOT NULL,
+        target_url           TEXT NOT NULL,
+        secret               TEXT NOT NULL,
+        max_attempts         INTEGER,
+        backoff_base_seconds DOUBLE PRECISION,
+        backoff_cap_seconds  DOUBLE PRECISION,
+        created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (subscription_id, revision)
+    )
+    """,
+    # 订阅的当前版本指针：发布时以 expected_revision 做 CAS 更新
+    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS current_revision INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS current_config_id BIGINT REFERENCES subscription_configs(id)",
+    # 投递固定使用的配置版本：创建时快照，之后（含重试）永不改变
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS config_id BIGINT REFERENCES subscription_configs(id)",
+    "CREATE INDEX IF NOT EXISTS idx_deliveries_config ON deliveries (config_id)",
+    # ---- 历史数据回填（幂等） ---------------------------------------------------
+    # 1) 为没有任何版本的订阅补建 revision=1（取订阅行当前的 url/secret）
+    """
+    INSERT INTO subscription_configs (subscription_id, revision, target_url, secret)
+    SELECT s.id, 1, s.target_url, s.secret
+    FROM subscriptions s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM subscription_configs c
+        WHERE c.subscription_id = s.id AND c.revision = 1
+    )
+    """,
+    # 2) 订阅行补上当前版本指针
+    """
+    UPDATE subscriptions s
+    SET current_revision = 1, current_config_id = c.id
+    FROM subscription_configs c
+    WHERE c.subscription_id = s.id AND c.revision = 1
+      AND s.current_config_id IS NULL
+    """,
+    # 3) 历史投递归属到订阅当前版本（对历史数据最贴近事实的重建）
+    """
+    UPDATE deliveries d
+    SET config_id = s.current_config_id
+    FROM subscriptions s
+    WHERE s.id = d.subscription_id
+      AND d.config_id IS NULL
+      AND s.current_config_id IS NOT NULL
+    """,
 ]
 
 
