@@ -7,6 +7,10 @@
 
 - **事件幂等提交**：生产者以 `(source, event_id)` 提交事件；重复提交返回原事件
   （HTTP 200，响应体 `duplicate: true`），**不新增任何投递**。
+- **订阅配置版本化 + 无损切换**：`target_url`、HMAC 密钥与重试参数保存为不可变版本
+  （revision 从 1 单调递增）。发布新版本必须携带 `expected_revision` 做 CAS；
+  切换边界与发布事务原子确定——边界前创建的投递及其后续重试/接管始终用旧版本，
+  边界后的投递用新版本；并发发布只有一个成功。详见下文[“配置版本与无损切换”](#配置版本与无损切换)。
 - **严格顺序投递**：同一订阅（source → target）严格按事件顺序处理——前一事件
   成功或进入死信之前，后一事件不会被发送。
 - **租约抢占与接管**：Worker 从数据库认领任务并持有租约；Worker 宕机/卡死导致
@@ -14,11 +18,12 @@
   （at-least-once 语义，极端接管场景下目标端可能收到一次重复投递）。
 - **HMAC 签名**：每次投递携带时间戳签名头
   `X-Webhook-Signature: t=<unix秒>,v1=<HMAC-SHA256 hex>`，签名内容为
-  `<timestamp>.<紧凑排序 JSON 载荷>`。
-- **指数退避 + 死信**：失败按 `base * 2^(n-1)` 退避（封顶），**最多 6 次尝试**
-  后进入死信队列。
+  `<timestamp>.<紧凑排序 JSON 载荷>`；密钥取自该投递钉住的配置版本。
+- **指数退避 + 死信**：失败按 `base * 2^(n-1)` 退避（封顶），重试次数与退避参数
+  均取自投递版本（默认最多 6 次尝试），满后进入死信队列。
 - **投递历史 / 死信重放**：可查询投递与每次尝试明细；重放会在同一投递链
   （`chain_id`）上**新建投递记录**（`chain_seq + 1`），旧记录完整保留。
+  重放默认沿用原版本，也可显式选用当前版本。
 - **本地回调接收器**：内置带签名校验、成功/失败/前 N 次失败/慢响应等端点的
   Receiver，便于本地联调与演示。
 
@@ -127,11 +132,13 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 | POST | `/events` | 提交/幂等提交事件；首次 201，重复 200 |
 | GET | `/events/{id}` | 查询事件 |
 | GET | `/events/{id}/deliveries` | 事件对应的所有投递 |
-| POST | `/subscriptions` | 注册订阅（同 source+URL 重复注册为重新激活） |
-| GET | `/subscriptions?source=` | 列出订阅 |
-| GET | `/subscriptions/{id}` | 查询订阅 |
-| GET | `/deliveries?status=&subscription_id=&source=` | 投递历史 |
-| GET | `/deliveries/{id}` | 投递详情 |
+| POST | `/subscriptions` | 注册订阅（同 source+URL 重复注册为重新激活；同时生成 revision=1） |
+| GET | `/subscriptions?source=` | 列出订阅（含 `current_revision`，不含密钥） |
+| GET | `/subscriptions/{id}` | 查询订阅（含 `current_revision`，不含密钥） |
+| POST | `/subscriptions/{id}/versions` | 发布新配置版本（CAS，必须带 `expected_revision`；201/409） |
+| GET | `/subscriptions/{id}/versions` | 列出全部配置版本与切换边界（不含密钥） |
+| GET | `/deliveries?status=&subscription_id=&source=&config_revision=` | 投递历史（含实际版本与边界） |
+| GET | `/deliveries/{id}` | 投递详情（含 `config_revision`、`config_effective_at`） |
 | GET | `/deliveries/{id}/attempts` | 每次尝试明细（状态码、响应摘要、错误、租约时间） |
 | GET | `/dead-letters?subscription_id=&source=` | 死信列表 |
 | POST | `/dead-letters/{id}/replay` | 死信重放（201；非死信 409；链上有未完成投递 409） |
@@ -139,6 +146,100 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 
 投递状态：`pending`（等待/退避中）、`in_flight`（已被 Worker 认领）、
 `succeeded`、`dead_lettered`。
+
+## 配置版本与无损切换
+
+每个订阅拥有一串**不可变**配置版本（`subscription_versions`）：
+
+- 版本内容：`target_url`、HMAC `secret`、`max_attempts`、
+  `backoff_base_seconds`、`backoff_cap_seconds`；
+- `revision` 从 1 开始单调递增；旧版本永不被修改/删除；
+- 每条投递（`deliveries.config_version_id`）在**创建的那一刻**固化所用版本。
+
+### 切换边界如何确定（原子性）
+
+- 发布新版本与事件提交都在**单数据库事务**内完成，且事件提交事务会先对该
+  source 的活跃订阅行加 `FOR UPDATE` 行锁，与发布事务互斥；
+- 因此每个与发布竞争的事件事务，其归属由“谁先拿到订阅行锁/先提交”唯一决定，
+  边界前后泾渭分明，不存在跨界投递；
+- 并发发布同一 `expected_revision`：只有一个 `201`，其余 `409`
+  （`detail.code = revision_conflict`）。
+
+### 版本对投递的影响（钉死语义）
+
+- **边界前**已创建的投递（含其全部后续重试、租约接管后的再投递）始终使用旧版本的
+  URL、密钥、`max_attempts` 与退避参数；
+- **边界后**创建的投递使用新版本；
+- Worker 每次执行都通过投递记录 JOIN 其版本读取 URL/密钥/重试参数，
+  重试时不会“顺手”改用当前版本；
+- 投递请求额外携带 `X-Webhook-Config-Revision: <revision>` 头，便于回调端识别。
+
+### 发布新版本
+
+```bash
+# 先取当前 revision
+curl -s localhost:8000/api/v1/subscriptions/1/versions
+
+# 发布（expected_revision 必须等于当前 revision；重试参数缺省继承当前版本）
+curl -i -X POST localhost:8000/api/v1/subscriptions/1/versions \
+  -H 'Content-Type: application/json' \
+  -d '{"target_url":"http://receiver:8001/receive",
+       "secret":"new-signing-secret",
+       "expected_revision":1,
+       "max_attempts":6,
+       "backoff_base_seconds":5,
+       "backoff_cap_seconds":300}'
+# 201 -> revision=2 生效；若期间别人已发布 -> 409 revision_conflict
+```
+
+版本查询返回（**不含 secret**）：
+
+```json
+[
+  {"version_id": 1, "subscription_id": 1, "revision": 1,
+   "target_url": "http://receiver:8001/receive",
+   "max_attempts": 6, "backoff_base_seconds": 5.0, "backoff_cap_seconds": 300.0,
+   "created_at": "…", "superseded_at": "…", "is_current": false},
+  {"version_id": 2, "subscription_id": 1, "revision": 2,
+   "target_url": "http://receiver:8001/receive",
+   "max_attempts": 6, "backoff_base_seconds": 5.0, "backoff_cap_seconds": 300.0,
+   "created_at": "…", "superseded_at": null, "is_current": true}
+]
+```
+
+`created_at` 是该版本成为当前版本的时刻（切换边界起点），`superseded_at` 是它
+被下一版本取代的时刻（当前版本为 `null`）。投递详情中的 `config_revision` 与
+`config_effective_at`（即该版本的 `created_at`）说明该投递实际使用的版本与边界；
+也可用 `/deliveries?config_revision=1` 按版本筛选。
+
+### 死信重放的版本选择
+
+```bash
+# 默认：新投递沿用原死信投递的版本（config_revision 不变）
+curl -i -X POST localhost:8000/api/v1/dead-letters/7/replay
+
+# 显式选用订阅当前版本
+curl -i -X POST localhost:8000/api/v1/dead-letters/7/replay \
+  -H 'Content-Type: application/json' -d '{"use_current_version":true}'
+```
+
+两种选择都随**新投递记录**固化（`config_version_id` 外键），之后该新记录的重试
+同样钉死所选版本。响应中 `config_revision` 即固化结果。
+
+### 注册时指定初始版本重试参数
+
+```bash
+curl -s -X POST localhost:8000/api/v1/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders",
+       "target_url":"http://receiver:8001/receive",
+       "secret":"dev-signing-secret",
+       "max_attempts":4,
+       "backoff_base_seconds":2,
+       "backoff_cap_seconds":60}'
+```
+
+三个重试参数均可省略，省略时 revision=1 使用服务端全局默认（`MAX_ATTEMPTS` 等）。
 
 ### 投递请求格式（Worker → 你的回调）
 
@@ -150,10 +251,12 @@ X-Webhook-Event: orders
 X-Webhook-Event-Id: evt-1001
 X-Webhook-Delivery-Id: 7
 X-Webhook-Attempt: 1
+X-Webhook-Config-Revision: 2
 ```
 
 - 载荷为紧凑 JSON（键排序、无空白），签名原文 `"<t>.<载荷>"`，HMAC-SHA256
-  使用订阅密钥。只有响应 **2xx** 视为成功；连接错误、超时、非 2xx 均计为一次失败。
+  使用**该投递钉住版本**的订阅密钥。只有响应 **2xx** 视为成功；连接错误、超时、
+  非 2xx 均计为一次失败。
 - 各语言验签示例（Python）：
 
 ```python
@@ -198,9 +301,9 @@ hmac.compare_digest(expected, signature_v1)
 | `LEASE_SECONDS` | `30` | 认领租约时长；过期可被接管 |
 | `HTTP_TIMEOUT_SECONDS` | `10` | 单次投递 HTTP 超时（应小于租约） |
 | `WORKER_POLL_SECONDS` | `1` | 无任务时 Worker 轮询间隔 |
-| `MAX_ATTEMPTS` | `6` | 最大尝试次数，达到后进死信 |
-| `BACKOFF_BASE_SECONDS` | `5` | 指数退避基数：`base*2^(n-1)` |
-| `BACKOFF_CAP_SECONDS` | `300` | 退避间隔上限 |
+| `MAX_ATTEMPTS` | `6` | 最大尝试次数，达到后进死信；仅作新建订阅 revision=1 的默认值，发布版本可按订阅覆盖 |
+| `BACKOFF_BASE_SECONDS` | `5` | 指数退避基数：`base*2^(n-1)`；同上，可被版本覆盖 |
+| `BACKOFF_CAP_SECONDS` | `300` | 退避间隔上限；同上，可被版本覆盖 |
 | `RECEIVER_SECRET` | `dev-signing-secret` | 接收器验签密钥，空则不强制 |
 | `RECEIVER_TIMESTAMP_TOLERANCE_SECONDS` | `300` | 签名时间戳允许偏差 |
 
@@ -211,9 +314,16 @@ hmac.compare_digest(expected, signature_v1)
 ## 数据库表
 
 - `events`：事件，`(source, event_id)` 唯一。
-- `subscriptions`：订阅（source、目标 URL、HMAC 密钥、是否启用）。
-- `deliveries`：投递记录。初始投递为 `(chain_id, chain_seq=1)`；重放沿用同一
-  `chain_id` 且 `chain_seq` 递增，从而保留完整历史。`seq` 是订阅顺序号。
+- `subscriptions`：订阅身份（source、启用状态、`current_revision`）。
+  `target_url/secret` 列随当前版本冗余同步；权威配置在版本表。
+- `subscription_versions`：不可变配置版本，`(subscription_id, revision)` 唯一。
+  保存 `target_url`、`secret`、`max_attempts`、退避参数；`created_at` 为该版本
+  成为当前版本的边界时刻，`superseded_at` 为被取代时刻。密钥仅服务端投递时使用，
+  从不出现在任何 API 响应中。
+- `deliveries`：投递记录。`config_version_id` 外键把投递钉死在其创建时的版本上
+  （重试/接管/重放都不改变，重放只新建记录并重新选择版本）。初始投递为
+  `(chain_id, chain_seq=1)`；重放沿用同一 `chain_id` 且 `chain_seq` 递增，
+  从而保留完整历史。`seq` 是订阅顺序号。
 - `delivery_attempts`：每次尝试的 Worker、结果分类（success/http_error/
   network_error/timeout）、HTTP 状态码、响应摘要（截断 2048 字符）、错误信息、
   租约起止时间。
@@ -231,5 +341,9 @@ python -m app.worker                               # Worker（可起多个）
 uvicorn app.receiver:app --port 8001               # 接收器
 ```
 
-仓库还包含 `test_e2e.py`：用便携 PostgreSQL 拉起完整四进程拓扑，覆盖幂等、
-顺序、退避死信、重放、租约接管等场景（开发验证用，非 Docker 依赖）。
+仓库还包含两个本地验证脚本（非 Docker 依赖，会自动拉起便携 PostgreSQL）：
+
+- `test_e2e.py`：完整四进程拓扑，覆盖幂等、顺序、退避死信、重放、租约接管、
+  配置版本 CAS 发布、无损切换、按钉住版本的重试参数结算与死信重放版本选择；
+- `test_concurrency.py`：高并发下发布与事件提交的原子边界压力测试，
+  并对每条收到的投递按其钉住版本密钥独立重新验签，证明重试不会跨界、不换密钥。

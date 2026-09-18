@@ -83,6 +83,9 @@ def _store(
         "event": request.headers.get("x-webhook-event"),
         "event_id": request.headers.get("x-webhook-event-id"),
         "attempt": request.headers.get("x-webhook-attempt"),
+        "config_revision": request.headers.get("x-webhook-config-revision"),
+        # 原始签名头，便于外部按各订阅版本密钥独立验签（接收器本身不保存订阅密钥）
+        "signature_header": request.headers.get("x-webhook-signature"),
         "signature_valid": sig_ok,
         "signature_message": sig_message,
         "responded_status": status_code,

@@ -1,10 +1,11 @@
-"""HTTP API：事件提交、订阅管理、投递历史、死信与重放。"""
+"""HTTP API：事件提交、订阅与配置版本管理、投递历史、死信与重放。"""
 from __future__ import annotations
 
 import asyncpg
 from fastapi import APIRouter, HTTPException, Query, Response
 
 from app import repository as repo
+from app.config import settings
 from app.db import get_pool
 from app.schemas import (
     AttemptOut,
@@ -12,8 +13,11 @@ from app.schemas import (
     EventCreate,
     EventOut,
     ReplayOut,
+    ReplayRequest,
     SubscriptionCreate,
     SubscriptionOut,
+    VersionOut,
+    VersionPublish,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -30,14 +34,17 @@ def _delivery_out(row: asyncpg.Record) -> DeliveryOut:
         event_source=data.get("event_source"),
         source_event_id=data.get("source_event_id"),
         target_url=data.get("target_url"),
+        config_version_id=data["config_version_id"],
+        config_revision=data["config_revision"],
+        config_effective_at=data["config_effective_at"],
         chain_id=data["chain_id"],
         chain_seq=data["chain_seq"],
         status=data["status"],
         attempts_made=data["attempts_made"],
         not_before=data["not_before"],
         leased_at=data["leased_at"],
-        lease_expires_at=data["lease_expires_at"],
-        leased_by=data["leased_by"],
+        lease_expires_at=data.get("lease_expires_at"),
+        leased_by=data.get("leased_by"),
         created_at=data["created_at"],
         updated_at=data["updated_at"],
     )
@@ -109,12 +116,33 @@ async def create_subscription(body: SubscriptionCreate) -> SubscriptionOut:
     pool = get_pool()
     target = str(body.target_url)
     async with pool.acquire() as conn:
-        row = await repo.create_subscription(conn, body.source, target, body.secret)
+        row = await repo.create_subscription(
+            conn,
+            body.source,
+            target,
+            body.secret,
+            max_attempts=(
+                body.max_attempts
+                if body.max_attempts is not None
+                else settings.max_attempts
+            ),
+            backoff_base_seconds=(
+                body.backoff_base_seconds
+                if body.backoff_base_seconds is not None
+                else settings.backoff_base_seconds
+            ),
+            backoff_cap_seconds=(
+                body.backoff_cap_seconds
+                if body.backoff_cap_seconds is not None
+                else settings.backoff_cap_seconds
+            ),
+        )
     return SubscriptionOut(
         id=row["id"],
         source=row["source"],
         target_url=row["target_url"],
         active=row["active"],
+        current_revision=row["current_revision"],
         created_at=row["created_at"],
     )
 
@@ -134,6 +162,7 @@ async def list_subscriptions(
             source=r["source"],
             target_url=r["target_url"],
             active=r["active"],
+            current_revision=r["current_revision"],
             created_at=r["created_at"],
         )
         for r in rows
@@ -156,8 +185,112 @@ async def get_subscription(subscription_id: int) -> SubscriptionOut:
         source=row["source"],
         target_url=row["target_url"],
         active=row["active"],
+        current_revision=row["current_revision"],
         created_at=row["created_at"],
     )
+
+
+# -- 订阅配置版本 / 无损切换 -----------------------------------------------------
+
+def _version_out(row: asyncpg.Record) -> VersionOut:
+    return VersionOut(
+        version_id=row["version_id"],
+        subscription_id=row["subscription_id"],
+        revision=row["revision"],
+        target_url=row["target_url"],
+        max_attempts=row["max_attempts"],
+        backoff_base_seconds=row["backoff_base_seconds"],
+        backoff_cap_seconds=row["backoff_cap_seconds"],
+        created_at=row["created_at"],
+        superseded_at=row["superseded_at"],
+        is_current=row["is_current"],
+    )
+
+
+@router.post(
+    "/subscriptions/{subscription_id}/versions",
+    response_model=VersionOut,
+    status_code=201,
+    tags=["subscriptions"],
+)
+async def publish_version(
+    subscription_id: int, body: VersionPublish
+) -> VersionOut:
+    """发布新的不可变配置版本（CAS）。
+
+    必须携带 `expected_revision`（调用方当前所见版本）。与当前版本不一致时
+    返回 409（并发发布只有一个成功）。切换边界与发布事务原子提交：边界前
+    已创建的投递及其重试始终使用旧版本，边界后的投递使用新版本。
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            sub = await repo.get_subscription_by_id(conn, subscription_id)
+            if sub is None:
+                raise HTTPException(status_code=404, detail="订阅不存在")
+            current = await repo.get_current_version(conn, subscription_id)
+            if current is None:  # 理论上不可能
+                raise HTTPException(status_code=404, detail="当前配置版本不存在")
+            try:
+                row, _revision = await repo.publish_version(
+                    conn,
+                    subscription_id=subscription_id,
+                    target_url=str(body.target_url),
+                    secret=body.secret,
+                    max_attempts=(
+                        body.max_attempts
+                        if body.max_attempts is not None
+                        else current["max_attempts"]
+                    ),
+                    backoff_base_seconds=(
+                        body.backoff_base_seconds
+                        if body.backoff_base_seconds is not None
+                        else float(current["backoff_base_seconds"])
+                    ),
+                    backoff_cap_seconds=(
+                        body.backoff_cap_seconds
+                        if body.backoff_cap_seconds is not None
+                        else float(current["backoff_cap_seconds"])
+                    ),
+                    expected_revision=body.expected_revision,
+                )
+            except repo.ConfigConflictError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": exc.code,
+                        "message": str(exc),
+                        "current_revision": exc.current_revision,
+                    },
+                )
+            except asyncpg.UniqueViolationError:
+                # 竞态兜底：expected_revision 校验通过但插入新版本时，
+                # 另一个并发发布已先提交（同 revision 唯一约束，事务随之回滚）。
+                # CAS 语义下这同样是一次失败的并发发布 -> 409；调用方重新获取
+                # 当前 revision 后重试。
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "revision_conflict",
+                        "message": "并发发布冲突：该 expected_revision 已被其他发布抢先提交",
+                    },
+                )
+    return _version_out({**row, "is_current": True})
+
+
+@router.get(
+    "/subscriptions/{subscription_id}/versions",
+    response_model=list[VersionOut],
+    tags=["subscriptions"],
+)
+async def list_versions(subscription_id: int) -> list[VersionOut]:
+    """列出订阅全部配置版本（含切换边界），不返回密钥。"""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        if await repo.get_subscription_by_id(conn, subscription_id) is None:
+            raise HTTPException(status_code=404, detail="订阅不存在")
+        rows = await repo.list_versions(conn, subscription_id)
+    return [_version_out(r) for r in rows]
 
 
 # -- 投递历史 / 死信 -------------------------------------------------------------
@@ -169,6 +302,9 @@ async def list_deliveries(
     status: str | None = Query(default=None),
     subscription_id: int | None = Query(default=None),
     source: str | None = Query(default=None),
+    config_revision: int | None = Query(
+        default=None, ge=1, description="只返回使用指定配置版本的投递"
+    ),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[DeliveryOut]:
@@ -183,6 +319,7 @@ async def list_deliveries(
             status=status,
             subscription_id=subscription_id,
             source=source,
+            config_revision=config_revision,
             limit=limit,
             offset=offset,
         )
@@ -258,12 +395,22 @@ async def list_dead_letters(
     status_code=201,
     tags=["dead-letters"],
 )
-async def replay_dead_letter(delivery_id: int) -> ReplayOut:
-    """重放死信：在同一条投递链上新建投递，旧记录完整保留。"""
+async def replay_dead_letter(
+    delivery_id: int, body: ReplayRequest | None = None
+) -> ReplayOut:
+    """重放死信：在同一条投递链上新建投递，旧记录完整保留。
+
+    默认沿用原投递的配置版本（`config_revision` 与原记录相同）；
+    请求体传 `{"use_current_version": true}` 可显式选用订阅当前版本。
+    选择结果固化在新投递记录上。
+    """
+    use_current = bool(body.use_current_version) if body is not None else False
     pool = get_pool()
     async with pool.acquire() as conn:
         try:
-            new_row = await repo.replay_dead_letter(conn, delivery_id)
+            new_row, config_revision = await repo.replay_dead_letter(
+                conn, delivery_id, use_current_version=use_current
+            )
         except LookupError:
             raise HTTPException(status_code=404, detail="投递不存在")
         except repo.ReplayError as exc:
@@ -275,4 +422,5 @@ async def replay_dead_letter(delivery_id: int) -> ReplayOut:
         chain_id=new_row["chain_id"],
         chain_seq=new_row["chain_seq"],
         status=new_row["status"],
+        config_revision=config_revision,
     )

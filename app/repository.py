@@ -1,4 +1,4 @@
-"""领域数据访问：事件、订阅、投递、投递尝试。"""
+"""领域数据访问：事件、订阅、订阅配置版本、投递、投递尝试。"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -14,12 +14,32 @@ class ReplayError(Exception):
         super().__init__(message)
         self.code = code
 
+
+class ConfigConflictError(Exception):
+    """发布新版本时 expected_revision 与当前版本不一致（CAS 失败）。"""
+
+    def __init__(self, current_revision: int):
+        super().__init__(
+            f"配置版本已变更：expected_revision 已过期，当前版本为 {current_revision}"
+        )
+        self.code = "revision_conflict"
+        self.current_revision = current_revision
+
+
 # -- 行 -> dict 映射 -----------------------------------------------------------
 
 DELIVERY_COLUMNS = """
-    d.id, d.event_id_fk, d.subscription_id, d.chain_id, d.chain_seq, d.status,
-    d.attempts_made, d.not_before, d.leased_at, d.lease_expires_at, d.leased_by,
+    d.id, d.event_id_fk, d.subscription_id, d.config_version_id,
+    d.chain_id, d.chain_seq, d.status, d.attempts_made, d.not_before,
+    d.leased_at, d.lease_expires_at, d.leased_by,
     d.created_at, d.updated_at
+"""
+
+# 版本查询返回的非敏感字段（绝不包含 secret）
+VERSION_COLUMNS = """
+    v.id AS version_id, v.subscription_id, v.revision, v.target_url,
+    v.max_attempts, v.backoff_base_seconds, v.backoff_cap_seconds,
+    v.created_at, v.superseded_at
 """
 
 
@@ -32,21 +52,51 @@ def delivery_to_dict(row: asyncpg.Record) -> dict[str, Any]:
 # -- 订阅 ----------------------------------------------------------------------
 
 async def create_subscription(
-    conn: asyncpg.Connection, source: str, target_url: str, secret: str
+    conn: asyncpg.Connection,
+    source: str,
+    target_url: str,
+    secret: str,
+    *,
+    max_attempts: int,
+    backoff_base_seconds: float,
+    backoff_cap_seconds: float,
 ) -> asyncpg.Record:
-    """新建订阅；(source, target_url) 已存在时重新激活并返回原行。"""
-    return await conn.fetchrow(
-        """
-        INSERT INTO subscriptions (source, target_url, secret)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (source, target_url) DO UPDATE
-            SET active = TRUE, secret = EXCLUDED.secret
-        RETURNING id, source, target_url, active, created_at
-        """,
-        source,
-        target_url,
-        secret,
-    )
+    """新建订阅并原子写入不可变的初始配置版本 revision=1。
+
+    (source, target_url) 已存在时仅重新激活（配置不变，沿用其当前版本）。
+    返回订阅行（含 current_revision）。
+    """
+    async with conn.transaction():
+        sub = await conn.fetchrow(
+            """
+            INSERT INTO subscriptions (source, target_url, secret, current_revision)
+            VALUES ($1, $2, $3, 1)
+            ON CONFLICT (source, target_url) DO UPDATE
+                SET active = TRUE
+            RETURNING id, source, target_url, active, created_at, current_revision,
+                      (xmax = 0) AS inserted
+            """,
+            source,
+            target_url,
+            secret,
+        )
+        # 仅对真正新建的订阅追加 revision=1；已存在的订阅其版本历史保持不变。
+        if sub["inserted"]:
+            await conn.execute(
+                """
+                INSERT INTO subscription_versions
+                    (subscription_id, revision, target_url, secret, max_attempts,
+                     backoff_base_seconds, backoff_cap_seconds)
+                VALUES ($1, 1, $2, $3, $4, $5, $6)
+                """,
+                sub["id"],
+                target_url,
+                secret,
+                max_attempts,
+                backoff_base_seconds,
+                backoff_cap_seconds,
+            )
+        return sub
 
 
 async def get_subscription_by_id(
@@ -54,7 +104,7 @@ async def get_subscription_by_id(
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
-        SELECT id, source, target_url, secret, active, created_at
+        SELECT id, source, target_url, active, current_revision, created_at
         FROM subscriptions WHERE id = $1
         """,
         subscription_id,
@@ -66,7 +116,7 @@ async def find_subscription(
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
-        SELECT id, source, target_url, active, created_at
+        SELECT id, source, target_url, active, current_revision, created_at
         FROM subscriptions WHERE source = $1 AND target_url = $2
         """,
         source,
@@ -80,7 +130,7 @@ async def list_subscriptions(
     if source is not None:
         rows = await conn.fetch(
             """
-            SELECT id, source, target_url, active, created_at
+            SELECT id, source, target_url, active, current_revision, created_at
             FROM subscriptions WHERE source = $1 ORDER BY id
             """,
             source,
@@ -88,11 +138,126 @@ async def list_subscriptions(
     else:
         rows = await conn.fetch(
             """
-            SELECT id, source, target_url, active, created_at
+            SELECT id, source, target_url, active, current_revision, created_at
             FROM subscriptions ORDER BY id
             """
         )
     return list(rows)
+
+
+# -- 订阅配置版本 / CAS 发布 ----------------------------------------------------
+
+async def publish_version(
+    conn: asyncpg.Connection,
+    *,
+    subscription_id: int,
+    target_url: str,
+    secret: str,
+    max_attempts: int,
+    backoff_base_seconds: float,
+    backoff_cap_seconds: float,
+    expected_revision: int,
+) -> tuple[asyncpg.Record, int]:
+    """以 CAS 方式发布新的不可变配置版本，并原子确定切换边界。
+
+    - 必须携带 expected_revision；与 subscriptions.current_revision 不一致则抛
+      ConfigConflictError（并发发布只有一个能成功）。
+    - 同一事务内：关闭旧版本边界（superseded_at=now）、追加新版本、推进
+      current_revision。事件提交事务会先锁订阅行，因此与发布竞争的事件要么在
+      边界前（钉旧版本）、要么在边界后（用新版本），不存在跨界。
+    - 不修改任何旧版本行；已存在的投递永远引用各自创建时的版本。
+
+    返回 (新版本行, 新 revision)。
+    """
+    async with conn.transaction():
+        # 行锁串行化同一订阅上的所有发布与事件提交，保证唯一切换边界。
+        sub = await conn.fetchrow(
+            """
+            SELECT id, current_revision
+            FROM subscriptions
+            WHERE id = $1
+            FOR UPDATE
+            """,
+            subscription_id,
+        )
+        if sub is None:
+            raise LookupError("subscription not found")
+        if sub["current_revision"] != expected_revision:
+            raise ConfigConflictError(sub["current_revision"])
+
+        new_revision = expected_revision + 1
+        await conn.execute(
+            """
+            UPDATE subscription_versions
+            SET superseded_at = now()
+            WHERE subscription_id = $1
+              AND revision = $2
+              AND superseded_at IS NULL
+            """,
+            subscription_id,
+            expected_revision,
+        )
+        version = await conn.fetchrow(
+            f"""
+            INSERT INTO subscription_versions AS v
+                (subscription_id, revision, target_url, secret, max_attempts,
+                 backoff_base_seconds, backoff_cap_seconds)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING {VERSION_COLUMNS}
+            """,
+            subscription_id,
+            new_revision,
+            target_url,
+            secret,
+            max_attempts,
+            backoff_base_seconds,
+            backoff_cap_seconds,
+        )
+        # 冗余的 subscriptions.target_url/secret 仅为兼容旧列，随当前版本同步。
+        await conn.execute(
+            """
+            UPDATE subscriptions
+            SET current_revision = $2, target_url = $3, secret = $4
+            WHERE id = $1
+            """,
+            subscription_id,
+            new_revision,
+            target_url,
+            secret,
+        )
+        return version, new_revision
+
+
+async def list_versions(
+    conn: asyncpg.Connection, subscription_id: int
+) -> list[asyncpg.Record]:
+    """列出某订阅全部配置版本（按 revision 升序）；不返回 secret。"""
+    rows = await conn.fetch(
+        f"""
+        SELECT {VERSION_COLUMNS},
+               (v.revision = s.current_revision) AS is_current
+        FROM subscription_versions v
+        JOIN subscriptions s ON s.id = v.subscription_id
+        WHERE v.subscription_id = $1
+        ORDER BY v.revision
+        """,
+        subscription_id,
+    )
+    return list(rows)
+
+
+async def get_current_version(
+    conn: asyncpg.Connection, subscription_id: int
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        f"""
+        SELECT {VERSION_COLUMNS}, TRUE AS is_current
+        FROM subscription_versions v
+        JOIN subscriptions s ON s.id = v.subscription_id
+        WHERE v.subscription_id = $1 AND v.revision = s.current_revision
+        """,
+        subscription_id,
+    )
 
 
 # -- 事件与投递创建 -------------------------------------------------------------
@@ -102,7 +267,12 @@ async def submit_event(
 ) -> tuple[asyncpg.Record, bool]:
     """幂等写入事件并为该 source 的所有活跃订阅创建投递。
 
+    每条投递固化创建时刻该订阅的当前配置版本（deliveries.config_version_id）。
     返回 (event 行, 是否重复提交)。重复提交不新增任何投递。
+
+    与发布新版本的边界：先对该 source 的活跃订阅行加 FOR UPDATE 行锁，
+    与 publish_version 互斥；两者均在单事务内提交，因此每条新投递必然落在
+    切换边界的确定一侧。
     """
     event_row = await conn.fetchrow(
         """
@@ -127,13 +297,27 @@ async def submit_event(
         )
         return event_row, True
 
+    # 锁住该 source 的活跃订阅：与版本发布串行，读 current_revision 时无竞态。
+    await conn.execute(
+        """
+        SELECT id FROM subscriptions
+        WHERE source = $1 AND active = TRUE
+        ORDER BY id
+        FOR UPDATE
+        """,
+        source,
+    )
     await conn.execute(
         """
         INSERT INTO deliveries
-            (event_id_fk, subscription_id, chain_id, chain_seq, status)
-        SELECT e.id, s.id, nextval('delivery_chain_seq'), 1, 'pending'
-        FROM events e, subscriptions s
-        WHERE e.id = $1 AND s.source = $2 AND s.active = TRUE
+            (event_id_fk, subscription_id, config_version_id,
+             chain_id, chain_seq, status)
+        SELECT e.id, s.id, v.id, nextval('delivery_chain_seq'), 1, 'pending'
+        FROM events e
+        JOIN subscriptions s ON s.source = $2 AND s.active = TRUE
+        JOIN subscription_versions v
+             ON v.subscription_id = s.id AND v.revision = s.current_revision
+        WHERE e.id = $1
         """,
         event_row["id"],
         source,
@@ -159,6 +343,7 @@ async def get_event(
 # 1) 先在事务中锁定该订阅“可投递且 seq 最小”的那一条（FOR UPDATE SKIP LOCKED）；
 # 2) 检查它前面是否还有未终结的投递，有则跳过（保证前一事件成功或进死信后才动）；
 # 3) 用 lease_token 栅栏把它置为 in_flight，旧租约必须已过期才可接管。
+# 认领/重试/接管一律不改变 config_version_id：投递钉死在创建时的版本上。
 async def claim_delivery(
     conn: asyncpg.Connection, worker_id: str
 ) -> dict[str, Any] | None:
@@ -209,8 +394,8 @@ async def claim_delivery(
                 leased_by = $4,
                 updated_at = $2
             WHERE id = $1
-            RETURNING id, event_id_fk, subscription_id, chain_id, chain_seq,
-                      attempts_made, status, not_before
+            RETURNING id, event_id_fk, subscription_id, config_version_id,
+                      chain_id, chain_seq, attempts_made, status, not_before
             """,
             candidate["id"],
             now,
@@ -231,6 +416,10 @@ async def claim_delivery(
 async def load_delivery_context(
     conn: asyncpg.Connection, delivery_id: int
 ) -> asyncpg.Record | None:
+    """加载投递上下文；target_url/secret/重试参数全部取自投递钉住的版本。
+
+    因而切换边界前创建的投递及其后续重试、接管，永远使用旧版本的 URL 与密钥。
+    """
     return await conn.fetchrow(
         """
         SELECT d.id AS delivery_id,
@@ -240,11 +429,17 @@ async def load_delivery_context(
                e.event_id,
                e.payload,
                s.id AS subscription_pk,
-               s.target_url,
-               s.secret
+               v.id AS config_version_pk,
+               v.revision AS config_revision,
+               v.target_url,
+               v.secret,
+               v.max_attempts,
+               v.backoff_base_seconds,
+               v.backoff_cap_seconds
         FROM deliveries d
         JOIN events e ON e.id = d.event_id_fk
         JOIN subscriptions s ON s.id = d.subscription_id
+        JOIN subscription_versions v ON v.id = d.config_version_id
         WHERE d.id = $1
         """,
         delivery_id,
@@ -316,11 +511,12 @@ async def settle_delivery(
     lease_token: str,
     succeeded: bool,
     not_before: datetime | None,
+    max_attempts: int,
 ) -> str | None:
     """根据本次尝试结果结算。
 
-    成功 -> succeeded；失败且已达 max_attempts -> dead_lettered；否则回到 pending
-    并设置指数退避时间。返回结算后的状态；租约失效返回 None。
+    成功 -> succeeded；失败且已达该投递所钉版本的 max_attempts -> dead_lettered；
+    否则回到 pending 并设置指数退避时间。返回结算后的状态；租约失效返回 None。
     """
     async with conn.transaction():
         locked = await conn.fetchrow(
@@ -335,7 +531,7 @@ async def settle_delivery(
 
         if succeeded:
             status = "succeeded"
-        elif locked["attempts_made"] >= settings.max_attempts:
+        elif locked["attempts_made"] >= max_attempts:
             status = "dead_lettered"
         else:
             status = "pending"
@@ -360,33 +556,45 @@ async def settle_delivery(
 
 # -- 查询：历史 / 死信 -----------------------------------------------------------
 
+_DELIVERY_SELECT = f"""
+    SELECT {DELIVERY_COLUMNS},
+           e.source AS event_source,
+           e.event_id AS source_event_id,
+           v.target_url AS target_url,
+           v.revision AS config_revision,
+           v.id AS config_version_pk,
+           v.created_at AS config_effective_at
+    FROM deliveries d
+    JOIN events e ON e.id = d.event_id_fk
+    JOIN subscriptions s ON s.id = d.subscription_id
+    JOIN subscription_versions v ON v.id = d.config_version_id
+"""
+
+
 async def list_deliveries(
     conn: asyncpg.Connection,
     *,
     status: str | None = None,
     subscription_id: int | None = None,
+    config_revision: int | None = None,
     source: str | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[asyncpg.Record]:
     rows = await conn.fetch(
-        f"""
-        SELECT {DELIVERY_COLUMNS},
-               e.source AS event_source,
-               e.event_id AS source_event_id,
-               s.target_url AS target_url
-        FROM deliveries d
-        JOIN events e ON e.id = d.event_id_fk
-        JOIN subscriptions s ON s.id = d.subscription_id
+        _DELIVERY_SELECT
+        + """
         WHERE ($1::text IS NULL OR d.status = $1)
           AND ($2::bigint IS NULL OR d.subscription_id = $2)
           AND ($3::text IS NULL OR e.source = $3)
+          AND ($4::int IS NULL OR v.revision = $4)
         ORDER BY d.id DESC
-        LIMIT $4 OFFSET $5
+        LIMIT $5 OFFSET $6
         """,
         status,
         subscription_id,
         source,
+        config_revision,
         limit,
         offset,
     )
@@ -397,16 +605,7 @@ async def get_delivery(
     conn: asyncpg.Connection, delivery_id: int
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
-        f"""
-        SELECT {DELIVERY_COLUMNS},
-               e.source AS event_source,
-               e.event_id AS source_event_id,
-               s.target_url AS target_url
-        FROM deliveries d
-        JOIN events e ON e.id = d.event_id_fk
-        JOIN subscriptions s ON s.id = d.subscription_id
-        WHERE d.id = $1
-        """,
+        _DELIVERY_SELECT + " WHERE d.id = $1",
         delivery_id,
     )
 
@@ -432,17 +631,7 @@ async def list_deliveries_for_event(
     conn: asyncpg.Connection, event_pk: int
 ) -> list[asyncpg.Record]:
     rows = await conn.fetch(
-        f"""
-        SELECT {DELIVERY_COLUMNS},
-               e.source AS event_source,
-               e.event_id AS source_event_id,
-               s.target_url AS target_url
-        FROM deliveries d
-        JOIN events e ON e.id = d.event_id_fk
-        JOIN subscriptions s ON s.id = d.subscription_id
-        WHERE d.event_id_fk = $1
-        ORDER BY d.id
-        """,
+        _DELIVERY_SELECT + " WHERE d.event_id_fk = $1 ORDER BY d.id",
         event_pk,
     )
     return list(rows)
@@ -451,17 +640,25 @@ async def list_deliveries_for_event(
 # -- 死信重放 --------------------------------------------------------------------
 
 async def replay_dead_letter(
-    conn: asyncpg.Connection, delivery_id: int
-) -> asyncpg.Record:
+    conn: asyncpg.Connection, delivery_id: int, *, use_current_version: bool = False
+) -> tuple[asyncpg.Record, int]:
     """为死信投递新建一条投递链记录（同 chain_id，chain_seq+1），保留旧记录。
 
-    原投递为非死信状态时抛 RaiseError(DLX)；链上已有活动投递时抛 RaiseError(BUSY)。
+    配置版本固化在新投递上：
+    - 默认沿用原投递钉住的版本（死信重放不改变 URL/密钥/重试参数）；
+    - use_current_version=True 时显式选用订阅当前版本。
+
+    原投递为非死信状态时抛 ReplayError(not_dead_lettered)；链上已有活动投递时
+    抛 ReplayError(chain_busy)。返回新投递行（含 config_revision）。
     """
     async with conn.transaction():
         original = await conn.fetchrow(
             """
-            SELECT id, event_id_fk, subscription_id, chain_id, chain_seq, status
-            FROM deliveries WHERE id = $1 FOR UPDATE
+            SELECT d.id, d.event_id_fk, d.subscription_id, d.chain_id, d.chain_seq,
+                   d.status, d.config_version_id
+            FROM deliveries d
+            WHERE d.id = $1
+            FOR UPDATE
             """,
             delivery_id,
         )
@@ -484,18 +681,61 @@ async def replay_dead_letter(
         if busy is not None:
             raise ReplayError("chain_busy", "该重放链上已有待投递/投递中的任务")
 
+        if use_current_version:
+            # 锁订阅行，与发布竞争时明确取已提交的当前版本。
+            current = await conn.fetchrow(
+                """
+                SELECT v.id AS config_version_id, v.revision AS config_revision
+                FROM subscriptions s
+                JOIN subscription_versions v
+                     ON v.subscription_id = s.id AND v.revision = s.current_revision
+                WHERE s.id = $1
+                FOR UPDATE OF s
+                """,
+                original["subscription_id"],
+            )
+            if current is None:  # 理论上不可能：订阅与版本必然存在
+                raise ReplayError("no_current_version", "订阅当前配置版本不存在")
+            config_version_id = current["config_version_id"]
+            config_revision = current["config_revision"]
+        else:
+            pinned = await conn.fetchrow(
+                """
+                SELECT v.id AS config_version_id, v.revision AS config_revision
+                FROM subscription_versions v
+                WHERE v.id = $1
+                """,
+                original["config_version_id"],
+            )
+            config_version_id = pinned["config_version_id"]
+            config_revision = pinned["config_revision"]
+
+        # chain_seq 取链上已有最大值 + 1（多次重放时原记录 chain_seq 恒为 1，
+        # 不能用 original.chain_seq + 1，否则第二次重放会撞唯一约束）。
+        next_seq = await conn.fetchval(
+            """
+            SELECT COALESCE(MAX(chain_seq), 0) + 1
+            FROM deliveries
+            WHERE subscription_id = $1 AND chain_id = $2
+            """,
+            original["subscription_id"],
+            original["chain_id"],
+        )
         new_row = await conn.fetchrow(
             """
             INSERT INTO deliveries
-                (event_id_fk, subscription_id, chain_id, chain_seq, status)
-            VALUES ($1, $2, $3, $4, 'pending')
-            RETURNING id, event_id_fk, subscription_id, chain_id, chain_seq,
-                      status, attempts_made, not_before, leased_at,
-                      lease_expires_at, leased_by, created_at, updated_at
+                (event_id_fk, subscription_id, config_version_id,
+                 chain_id, chain_seq, status)
+            VALUES ($1, $2, $3, $4, $5, 'pending')
+            RETURNING id, event_id_fk, subscription_id, config_version_id,
+                      chain_id, chain_seq, status, attempts_made, not_before,
+                      leased_at, lease_expires_at, leased_by, created_at, updated_at
             """,
             original["event_id_fk"],
             original["subscription_id"],
+            config_version_id,
             original["chain_id"],
-            original["chain_seq"] + 1,
+            next_seq,
         )
-        return new_row
+        # 附上 revision 供 API 响应使用
+        return new_row, config_revision

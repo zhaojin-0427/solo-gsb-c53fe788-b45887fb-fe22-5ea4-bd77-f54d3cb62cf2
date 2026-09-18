@@ -285,20 +285,37 @@ def main() -> int:
             )
             sub = await conn.fetchrow(
                 """
-                INSERT INTO subscriptions (source, target_url, secret)
-                VALUES ('lease', $1, 'dev-signing-secret')
+                INSERT INTO subscriptions (source, target_url, secret, current_revision)
+                VALUES ('lease', $1, 'dev-signing-secret', 1)
                 ON CONFLICT (source, target_url) DO UPDATE SET active = TRUE
                 RETURNING id
                 """,
                 f"{h.rcv}/receive",
             )
+            ver = await conn.fetchrow(
+                """
+                INSERT INTO subscription_versions
+                    (subscription_id, revision, target_url, secret,
+                     max_attempts, backoff_base_seconds, backoff_cap_seconds)
+                SELECT $1, 1, target_url, secret, 6, 1.0, 8.0
+                FROM subscriptions WHERE id = $1
+                ON CONFLICT (subscription_id, revision) DO NOTHING
+                RETURNING id
+                """,
+                sub["id"],
+            )
+            if ver is None:
+                ver = await conn.fetchrow(
+                    "SELECT id FROM subscription_versions WHERE subscription_id=$1 AND revision=1",
+                    sub["id"],
+                )
             row = await conn.fetchrow(
                 """
                 INSERT INTO deliveries
-                    (event_id_fk, subscription_id, chain_id, chain_seq,
+                    (event_id_fk, subscription_id, config_version_id, chain_id, chain_seq,
                      status, attempts_made, not_before,
                      leased_at, lease_expires_at, leased_by)
-                VALUES ($1, $2, nextval('delivery_chain_seq'), 1,
+                VALUES ($1, $2, $3, nextval('delivery_chain_seq'), 1,
                         'in_flight', 0, now() - interval '1 hour',
                         now() - interval '1 minute',
                         now() - interval '57 seconds',
@@ -307,6 +324,7 @@ def main() -> int:
                 """,
                 ev["id"],
                 sub["id"],
+                ver["id"],
             )
             await conn.close()
             return ev["id"], row["id"]
@@ -323,6 +341,199 @@ def main() -> int:
               and lease_attempts
               and lease_attempts[0]["worker_id"] != "dead-worker",
               f"worker={lease_attempts[0]['worker_id'] if lease_attempts else None}")
+
+        # 7) 订阅配置版本与无损切换
+        # 7.1 初始订阅 revision=1，携带按订阅的重试参数
+        versub = api.post("/api/v1/subscriptions", json={
+            "source": "ver",
+            "target_url": f"{h.rcv}/fail/2",
+            "secret": "dev-signing-secret",
+            "max_attempts": 3,
+            "backoff_base_seconds": 1,
+            "backoff_cap_seconds": 2,
+        }).json()
+        sid = versub["id"]
+        check("新订阅 current_revision=1", versub["current_revision"] == 1)
+        vlist = api.get(f"/api/v1/subscriptions/{sid}/versions").json()
+        check(
+            "版本列表初始 1 条且无密钥泄露",
+            len(vlist) == 1
+            and vlist[0]["revision"] == 1
+            and vlist[0]["is_current"] is True
+            and vlist[0]["max_attempts"] == 3
+            and "secret" not in vlist[0],
+        )
+
+        # 7.2 边界前创建的投递钉在 revision 1（/fail/2：前两次失败后成功）
+        api.post("/api/v1/events", json={
+            "source": "ver", "event_id": "ver-old", "payload": {},
+        })
+        old_delivery = wait_for(
+            lambda: next((x for x in api.get("/api/v1/deliveries",
+                        params={"source": "ver"}).json()
+                         if x["source_event_id"] == "ver-old"), None),
+            "ver-old 投递创建",
+        )
+        check("边界前投递钉在 revision 1", old_delivery["config_revision"] == 1)
+        # 等它失败一次（证明此刻还在用旧版本 URL /fail/2），再发布 rev2
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{old_delivery['id']}").json()["attempts_made"] >= 1,
+            "ver-old 已按旧版本失败 >=1 次", timeout=20,
+        )
+
+        # 7.3 CAS：错误的 expected_revision 必须 409
+        bad_cas = api.post(f"/api/v1/subscriptions/{sid}/versions", json={
+            "target_url": f"{h.rcv}/receive",
+            "secret": "dev-signing-secret",
+            "expected_revision": 99,
+        })
+        check("CAS expected_revision 不匹配返回 409", bad_cas.status_code == 409)
+
+        # 7.4 并发发布：携带相同 expected_revision，只能有一个成功
+        import concurrent.futures
+
+        def publish(rev):
+            return httpx.post(
+                f"{h.api}/api/v1/subscriptions/{sid}/versions",
+                json={
+                    "target_url": f"{h.rcv}/receive",
+                    "secret": "dev-signing-secret",
+                    "expected_revision": rev,
+                },
+                timeout=10,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(publish, 1), ex.submit(publish, 1)]
+            codes = sorted(f.result().status_code for f in futs)
+        check("并发发布只有一个成功", codes == [201, 409], str(codes))
+
+        vlist = api.get(f"/api/v1/subscriptions/{sid}/versions").json()
+        check(
+            "发布后 rev2 为当前、rev1 有切换边界 superseded_at",
+            [v["revision"] for v in vlist] == [1, 2]
+            and vlist[1]["is_current"] is True
+            and vlist[1]["target_url"].endswith("/receive")
+            and vlist[0]["superseded_at"] is not None
+            and vlist[1]["superseded_at"] is None,
+        )
+        check(
+            "重试参数缺省继承当前版本",
+            vlist[1]["max_attempts"] == 3
+            and vlist[1]["backoff_base_seconds"] == 1.0
+            and vlist[1]["backoff_cap_seconds"] == 2.0,
+        )
+
+        # 7.5 边界前的投递重试始终使用旧版本：最终经 /fail/2 成功，且 revision 仍为 1
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{old_delivery['id']}").json()["status"] == "succeeded",
+            "旧投递按旧版本重试成功", timeout=30,
+        )
+        old_final = api.get(f"/api/v1/deliveries/{old_delivery['id']}").json()
+        check(
+            "边界前投递重试不改版本（仍 rev1，走 /fail/2）",
+            old_final["config_revision"] == 1
+            and old_final["target_url"].endswith("/fail/2"),
+        )
+
+        # 7.6 边界后的投递使用新版本（rev2，/receive）
+        api.post("/api/v1/events", json={
+            "source": "ver", "event_id": "ver-new", "payload": {},
+        })
+        new_delivery = wait_for(
+            lambda: next((x for x in api.get("/api/v1/deliveries",
+                        params={"source": "ver"}).json()
+                         if x["source_event_id"] == "ver-new"), None),
+            "ver-new 投递创建",
+        )
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{new_delivery['id']}").json()["status"] == "succeeded",
+            "边界后投递成功", timeout=15,
+        )
+        new_final = api.get(f"/api/v1/deliveries/{new_delivery['id']}").json()
+        check(
+            "边界后投递使用 rev2 与新 URL，一次成功",
+            new_final["config_revision"] == 2
+            and new_final["target_url"].endswith("/receive")
+            and new_final["attempts_made"] == 1,
+        )
+
+        # 7.7 按钉住版本的 max_attempts 结算 + 死信重放版本选择
+        # 步骤 5 曾关闭 /fail；这里重新打开以制造死信
+        rcv.post("/control/fail", params={"enabled": True}).raise_for_status()
+        dlsub = api.post("/api/v1/subscriptions", json={
+            "source": "verdl",
+            "target_url": f"{h.rcv}/fail",
+            "secret": "dev-signing-secret",
+            "max_attempts": 2,
+            "backoff_base_seconds": 1,
+            "backoff_cap_seconds": 2,
+        }).json()
+        dlsid = dlsub["id"]
+        api.post("/api/v1/events", json={
+            "source": "verdl", "event_id": "ver-dl-1", "payload": {},
+        })
+        dl_old = wait_for(
+            lambda: next((x for x in api.get("/api/v1/deliveries",
+                        params={"source": "verdl"}).json()
+                         if x["source_event_id"] == "ver-dl-1"), None),
+            "ver-dl-1 投递创建",
+        )
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{dl_old['id']}").json()["status"] == "dead_lettered",
+            "旧版本 max_attempts=2 -> 死信", timeout=30,
+        )
+        dl_old = api.get(f"/api/v1/deliveries/{dl_old['id']}").json()
+        check(
+            "投递按其版本 max_attempts=2 进死信（非全局 6）",
+            dl_old["attempts_made"] == 2 and dl_old["config_revision"] == 1,
+        )
+
+        # 发布 rev2：改到 /receive（始终 200）
+        pub2 = api.post(f"/api/v1/subscriptions/{dlsid}/versions", json={
+            "target_url": f"{h.rcv}/receive",
+            "secret": "dev-signing-secret",
+            "expected_revision": 1,
+        })
+        check("verdl 发布 rev2 成功", pub2.status_code == 201, pub2.text)
+
+        # 默认重放沿用原版本 rev1：关闭 /fail 使其成功，但记录仍钉 rev1
+        rcv.post("/control/fail", params={"enabled": False}).raise_for_status()
+        rp1 = api.post(f"/api/v1/dead-letters/{dl_old['id']}/replay", json={})
+        check("默认重放 201", rp1.status_code == 201, rp1.text)
+        rp1_id = rp1.json()["new_delivery_id"]
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{rp1_id}").json()["status"] == "succeeded",
+            "重放(旧版本)成功", timeout=15,
+        )
+        rp1_d = api.get(f"/api/v1/deliveries/{rp1_id}").json()
+        check(
+            "默认重放沿用原版本 rev1 且同链 chain_seq 递增",
+            rp1.json()["config_revision"] == 1
+            and rp1_d["config_revision"] == 1
+            and rp1_d["chain_id"] == dl_old["chain_id"]
+            and rp1_d["chain_seq"] == dl_old["chain_seq"] + 1,
+        )
+
+        # 显式当前版本重放：use_current_version=true -> rev2
+        rp2 = api.post(
+            f"/api/v1/dead-letters/{dl_old['id']}/replay",
+            json={"use_current_version": True},
+        )
+        check("当前版本重放 201", rp2.status_code == 201, rp2.text)
+        rp2_id = rp2.json()["new_delivery_id"]
+        wait_for(
+            lambda: api.get(f"/api/v1/deliveries/{rp2_id}").json()["status"] == "succeeded",
+            "重放(当前版本)成功", timeout=15,
+        )
+        rp2_d = api.get(f"/api/v1/deliveries/{rp2_id}").json()
+        check(
+            "显式当前版本重放钉在 rev2 与新 URL，且 chain_seq 继续递增",
+            rp2.json()["config_revision"] == 2
+            and rp2_d["config_revision"] == 2
+            and rp2_d["target_url"].endswith("/receive")
+            and rp2_d["chain_seq"] == rp1_d["chain_seq"] + 1,
+        )
 
     except Exception as exc:  # noqa: BLE001
         import traceback

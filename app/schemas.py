@@ -26,6 +26,10 @@ class SubscriptionCreate(BaseModel):
     source: str = Field(min_length=1, max_length=200)
     target_url: HttpUrl
     secret: str = Field(min_length=8, max_length=400)
+    # 初始版本（revision=1）的重试参数；缺省取服务端全局默认（见配置表）
+    max_attempts: int | None = Field(default=None, ge=1, le=100)
+    backoff_base_seconds: float | None = Field(default=None, gt=0, le=86400)
+    backoff_cap_seconds: float | None = Field(default=None, gt=0, le=86400)
 
 
 class SubscriptionOut(BaseModel):
@@ -33,7 +37,40 @@ class SubscriptionOut(BaseModel):
     source: str
     target_url: str
     active: bool
+    current_revision: int
     created_at: datetime
+
+
+class VersionPublish(BaseModel):
+    """发布订阅配置新版本。
+
+    target_url/secret/重试参数构成新的不可变版本；重试参数缺省继承当前版本。
+    expected_revision 必填（CAS）：必须等于调用方所见的当前 revision，否则 409。
+    """
+
+    target_url: HttpUrl
+    secret: str = Field(min_length=8, max_length=400)
+    expected_revision: int = Field(ge=1)
+    max_attempts: int | None = Field(default=None, ge=1, le=100)
+    backoff_base_seconds: float | None = Field(default=None, gt=0, le=86400)
+    backoff_cap_seconds: float | None = Field(default=None, gt=0, le=86400)
+
+
+class VersionOut(BaseModel):
+    """配置版本视图：含实际版本与切换边界，但绝不包含 secret。"""
+
+    version_id: int
+    subscription_id: int
+    revision: int
+    target_url: str
+    max_attempts: int
+    backoff_base_seconds: float
+    backoff_cap_seconds: float
+    # 该版本成为当前版本（切换边界开始）的时刻
+    created_at: datetime
+    # 被下一版本取代（切换边界结束）的时刻；当前版本为 None
+    superseded_at: datetime | None = None
+    is_current: bool
 
 
 class AttemptOut(BaseModel):
@@ -56,7 +93,12 @@ class DeliveryOut(BaseModel):
     subscription_id: int
     event_source: str | None = None
     source_event_id: str | None = None
+    # 实际投递目标（该投递钉住版本的 target_url，非订阅当前 URL）
     target_url: str | None = None
+    # 该投递实际固化使用的配置版本，及其切换边界（生效时刻）
+    config_version_id: int
+    config_revision: int
+    config_effective_at: datetime
     chain_id: int | None = None
     chain_seq: int
     status: Literal["pending", "in_flight", "succeeded", "dead_lettered"]
@@ -69,9 +111,16 @@ class DeliveryOut(BaseModel):
     updated_at: datetime
 
 
+class ReplayRequest(BaseModel):
+    # 默认沿用原投递版本；显式 true 时选用订阅当前版本
+    use_current_version: bool = False
+
+
 class ReplayOut(BaseModel):
     replayed_from_delivery_id: int
     new_delivery_id: int
     chain_id: int
     chain_seq: int
     status: str
+    # 新投递固化的配置版本（默认与原投递相同）
+    config_revision: int

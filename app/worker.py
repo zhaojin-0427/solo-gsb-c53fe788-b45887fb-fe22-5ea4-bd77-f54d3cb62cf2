@@ -30,12 +30,15 @@ WORKER_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 RESPONSE_EXCERPT_LIMIT = 2048
 
 
-def compute_backoff(attempt_number: int) -> datetime:
-    """第 attempt_number 次失败后，下次可投递时间（指数退避，封顶）。"""
-    delay = min(
-        settings.backoff_cap_seconds,
-        settings.backoff_base_seconds * (2 ** (attempt_number - 1)),
-    )
+def compute_backoff(
+    attempt_number: int, base_seconds: float, cap_seconds: float
+) -> datetime:
+    """第 attempt_number 次失败后，下次可投递时间（指数退避，封顶）。
+
+    base/cap 取自该投递钉住的配置版本：旧投递即使在配置发布后重试，
+    也继续沿用其创建时版本的退避参数。
+    """
+    delay = min(cap_seconds, base_seconds * (2 ** (attempt_number - 1)))
     return datetime.now(timezone.utc) + timedelta(seconds=delay)
 
 
@@ -59,6 +62,8 @@ async def deliver_once(
         "X-Webhook-Event-Id": context["event_id"],
         "X-Webhook-Delivery-Id": str(context["delivery_id"]),
         "X-Webhook-Attempt": str(context["attempt_number"]),
+        # 本次投递实际使用的配置版本（钉在投递记录上，重试/接管不变）
+        "X-Webhook-Config-Revision": str(context["config_revision"]),
         "User-Agent": "reliable-webhook/1.0",
     }
     try:
@@ -106,6 +111,14 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
         return True
     context = dict(context_row)
     context["attempt_number"] = delivery["attempts_made"] + 1
+    log.info(
+        "worker=%s 认领投递 id=%s event=%s revision=%s attempt(即将)=%s",
+        WORKER_ID,
+        delivery_id,
+        delivery["event_id_fk"],
+        context.get("config_revision"),
+        context["attempt_number"],
+    )
 
     outcome, http_status, excerpt, error_message, succeeded = await deliver_once(
         client, context
@@ -134,13 +147,22 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
             )
             return True
 
-        not_before = None if succeeded else compute_backoff(attempt_number)
+        not_before = (
+            None
+            if succeeded
+            else compute_backoff(
+                attempt_number,
+                float(context["backoff_base_seconds"]),
+                float(context["backoff_cap_seconds"]),
+            )
+        )
         new_status = await repo.settle_delivery(
             conn,
             delivery_id=delivery_id,
             lease_token=lease_token,
             succeeded=succeeded,
             not_before=not_before,
+            max_attempts=int(context["max_attempts"]),
         )
 
     if new_status == "succeeded":
@@ -149,7 +171,7 @@ async def handle_one(pool, client: httpx.AsyncClient) -> bool:
         log.error(
             "投递 id=%s 已达 %s 次尝试，进入死信",
             delivery_id,
-            settings.max_attempts,
+            context["max_attempts"],
         )
     else:
         log.info(
